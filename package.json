@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Controller->Agents tab sync for Dolphin{anty} via CDP",
   "scripts": {
+    "start": "node ./sync-server/server.js",
     "server": "node ./sync-server/server.js",
     "agent": "node ./agent/agent.js",
     "dev": "node ./sync-server/server.js"
