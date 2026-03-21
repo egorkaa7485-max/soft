@@ -3,7 +3,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
-const PORT = Number.parseInt(process.env.SYNC_SERVER_PORT ?? '8787', 10);
+const PORT = Number.parseInt(process.env.PORT ?? process.env.SYNC_SERVER_PORT ?? '8787', 10);
 
 const app = express();
 app.use(express.json());
