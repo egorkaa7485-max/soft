@@ -13,6 +13,10 @@ function loadConfig() {
   return JSON.parse(raw);
 }
 
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -20,6 +24,10 @@ function sleep(ms) {
 function clamp01(n) {
   if (Number.isNaN(n) || !Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(1, n));
+}
+
+function sanitizeFileName(input) {
+  return String(input).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
 }
 
 function pickPage(pages, preferUrlIncludes) {
@@ -55,6 +63,23 @@ async function dolphinStopProfile(dolphinBaseUrl, profileId) {
   await axios.get(url, { timeout: 30_000 });
 }
 
+async function dolphinListProfiles(dolphinBaseUrl) {
+  const urls = [
+    `${dolphinBaseUrl}/v1.0/browser_profiles?limit=1000&page=1`,
+    `${dolphinBaseUrl}/v1.0/browser_profiles`,
+    `${dolphinBaseUrl}/v1.0/browser_profiles/running`
+  ];
+  for (const url of urls) {
+    try {
+      const r = await axios.get(url, { timeout: 30_000 });
+      const d = r.data;
+      const items = Array.isArray(d?.data) ? d.data : (Array.isArray(d) ? d : []);
+      if (items.length) return items;
+    } catch {}
+  }
+  return [];
+}
+
 async function connectCdp({ port, wsEndpoint }) {
   const browserWSEndpoint = `ws://127.0.0.1:${port}${wsEndpoint}`;
   const browser = await puppeteer.connect({ browserWSEndpoint, defaultViewport: null });
@@ -78,6 +103,26 @@ async function main() {
   const serverWsUrl = cfg.serverWsUrl;
   const dolphinBaseUrl = cfg.dolphin.baseUrl;
   const dolphinToken = cfg.dolphin.token;
+  const autoDiscover = !!cfg.dolphin.autoDiscoverRunningProfileIds;
+  if (autoDiscover) {
+    await dolphinLogin(dolphinBaseUrl, dolphinToken);
+    const profiles = await dolphinListProfiles(dolphinBaseUrl);
+    const discovered = profiles
+      .filter((p) => {
+        const running = p?.running === true || p?.is_running === true || p?.status === 'running';
+        return running;
+      })
+      .map((p) => String(p?.id ?? p?.browserProfileId ?? p?.profile_id ?? ''))
+      .filter(Boolean);
+    if (discovered.length) {
+      cfg.dolphin.profileIds = discovered;
+      saveConfig(cfg);
+      console.log(`[${agentId}] discovered running profileIds: ${discovered.length}`);
+    } else {
+      console.log(`[${agentId}] auto-discover found no running profiles, using config profileIds`);
+    }
+  }
+
   const profileIds = Array.isArray(cfg.dolphin.profileIds) && cfg.dolphin.profileIds.length
     ? cfg.dolphin.profileIds
     : (cfg.dolphin.profileId ? [cfg.dolphin.profileId] : []);
@@ -86,6 +131,8 @@ async function main() {
   }
   const preferUrlIncludes = cfg.target?.preferUrlIncludes ?? '';
   const forceViewport = cfg.target?.forceViewport ?? { enabled: false };
+  const copiedDir = path.resolve(process.cwd(), 'agent', 'copied');
+  if (!fs.existsSync(copiedDir)) fs.mkdirSync(copiedDir, { recursive: true });
 
   let syncEnabled = true;
 
@@ -201,6 +248,42 @@ async function main() {
     if (ev.kind === 'up') await page.keyboard.up(ev.key);
   }
 
+  async function applyInput(ev, page) {
+    if (!ev.selector) return;
+    await page.evaluate(({ selector, value }) => {
+      const el = document.querySelector(selector);
+      if (!el) return;
+      if ('value' in el) {
+        el.focus();
+        el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, { selector: ev.selector, value: String(ev.value ?? '') });
+  }
+
+  async function applyNavigate(ev, page) {
+    const url = String(ev.url ?? '').trim();
+    if (!url) return;
+    if (ev.kind === 'back') {
+      await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      return;
+    }
+    if (ev.kind === 'forward') {
+      await page.goForward({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      return;
+    }
+    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  }
+
+  async function storeCopiedText(profileId, ev) {
+    const text = String(ev.text ?? '').trim();
+    if (!text) return;
+    const out = path.join(copiedDir, `${sanitizeFileName(profileId)}.txt`);
+    const line = `[${new Date().toISOString()}] ${ev.href ?? ''}\n${text}\n\n`;
+    fs.appendFileSync(out, line, 'utf8');
+  }
+
   async function ensureAllConnected() {
     await Promise.all(profileIds.map(async (pid) => {
       const s = sessions[pid];
@@ -234,6 +317,9 @@ async function main() {
         if (ev.eventType === 'mouse') await applyMouse(ev, page);
         else if (ev.eventType === 'wheel') await applyWheel(ev, page);
         else if (ev.eventType === 'key') await applyKey(ev, page);
+        else if (ev.eventType === 'input') await applyInput(ev, page);
+        else if (ev.eventType === 'navigate') await applyNavigate(ev, page);
+        else if (ev.eventType === 'copy') await storeCopiedText(pid, ev);
       }));
     } catch (e) {
       console.error(`[${agentId}] apply event failed:`, e?.message ?? e);

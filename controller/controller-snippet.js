@@ -4,7 +4,7 @@
 // Он шлёт события на центральный сервер, агенты воспроизводят их через CDP.
 
 (() => {
-  const SERVER_WS = 'ws://192.168.100.27:8787/ws';
+  const SERVER_WS = 'wss://soft-production-e391.up.railway.app/ws';
   const CONTROLLER_ID = 'controller-main';
 
   const ws = new WebSocket(SERVER_WS);
