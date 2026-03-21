@@ -1,9 +1,32 @@
 import express from 'express';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
 const PORT = Number.parseInt(process.env.PORT ?? process.env.SYNC_SERVER_PORT ?? '8787', 10);
+const CLIPBOARD_LOG_DIR = process.env.CLIPBOARD_LOG_DIR
+  ? path.resolve(process.env.CLIPBOARD_LOG_DIR)
+  : path.resolve(process.cwd(), 'clipboard-logs');
+
+function safeClipboardFileId(id) {
+  return String(id || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+}
+
+function appendClipboardLogFile(windowId, text, kind = 'copy') {
+  const t = String(text ?? '');
+  if (!t) return;
+  try {
+    fs.mkdirSync(CLIPBOARD_LOG_DIR, { recursive: true });
+    const file = path.join(CLIPBOARD_LOG_DIR, `${safeClipboardFileId(windowId)}.log`);
+    const iso = new Date().toISOString();
+    const header = `\n### ${iso} window=${windowId} kind=${kind} len=${t.length} ###\n`;
+    fs.appendFileSync(file, `${header}${t}\n`, 'utf8');
+  } catch (e) {
+    console.error('[clipboard-log]', e?.message ?? e);
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -286,6 +309,13 @@ wss.on('connection', (ws) => {
     c.lastSeen = now();
 
     if (c.role === 'controller' && msg.type === 'controllerEvent') {
+      const p = msg.payload;
+      /** Копирование с главного окна — только в файл, агентам не шлём (у каждого свой буфер). */
+      if (p && p.eventType === 'copy') {
+        const wid = `controller-${c.id}`;
+        appendClipboardLogFile(wid, p.text, p.kind || 'copy');
+        return;
+      }
       broadcastToAgents(msg.payload);
       return;
     }
@@ -303,5 +333,6 @@ wss.on('connection', (ws) => {
 server.listen(PORT, () => {
   console.log(`Sync server listening: http://0.0.0.0:${PORT}`);
   console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
+  console.log(`Clipboard logs (главное окно): ${CLIPBOARD_LOG_DIR}/*.log`);
 });
 

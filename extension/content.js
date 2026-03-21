@@ -4,7 +4,9 @@
 
   const state = {
     started: true,
-    lastMoveTs: 0
+    lastMoveTs: 0,
+    /** URL страницы до SPA-перехода (для sync только при совпадении с агентом) */
+    lastCommittedHref: typeof location !== 'undefined' ? location.href : ''
   };
 
   function nx(x) {
@@ -45,7 +47,7 @@
 
   window.addEventListener('mousemove', (e) => {
     const t = performance.now();
-    if (t - state.lastMoveTs < 25) return;
+    if (t - state.lastMoveTs < 40) return;
     state.lastMoveTs = t;
     send({
       eventType: 'mouse',
@@ -143,22 +145,71 @@
     });
   }, true);
 
-  window.addEventListener('copy', () => {
-    const text = String(window.getSelection?.() ?? '').trim();
-    if (!text) return;
+  /**
+   * Копирование/вырезание: шлём только для лога на сервере (файл по id главного окна).
+   * Текст не транслируется на агентов — у каждого профиля свой виртуальный буфер.
+   */
+  function sendClipboard(kind, text) {
+    const t = String(text ?? '');
+    if (!t) return;
     send({
       eventType: 'copy',
-      text,
+      kind,
+      text: t,
       ts: Date.now(),
       href: location.href
     });
-  }, true);
+  }
+
+  document.addEventListener(
+    'copy',
+    (e) => {
+      const t =
+        (e.clipboardData && e.clipboardData.getData('text/plain')) ||
+        (window.getSelection() && window.getSelection().toString()) ||
+        '';
+      sendClipboard('copy-dom', t);
+    },
+    true
+  );
+
+  document.addEventListener(
+    'cut',
+    (e) => {
+      const t =
+        (e.clipboardData && e.clipboardData.getData('text/plain')) ||
+        (window.getSelection() && window.getSelection().toString()) ||
+        '';
+      sendClipboard('cut-dom', t);
+    },
+    true
+  );
 
   window.addEventListener('popstate', () => {
-    send({ eventType: 'navigate', kind: 'url', url: location.href, ts: Date.now(), href: location.href });
+    const fromHref = state.lastCommittedHref;
+    const url = location.href;
+    state.lastCommittedHref = url;
+    send({
+      eventType: 'navigate',
+      kind: 'url',
+      url,
+      fromHref,
+      ts: Date.now(),
+      href: url
+    });
   }, true);
   window.addEventListener('hashchange', () => {
-    send({ eventType: 'navigate', kind: 'url', url: location.href, ts: Date.now(), href: location.href });
+    const fromHref = state.lastCommittedHref;
+    const url = location.href;
+    state.lastCommittedHref = url;
+    send({
+      eventType: 'navigate',
+      kind: 'url',
+      url,
+      fromHref,
+      ts: Date.now(),
+      href: url
+    });
   }, true);
 
   window[NS] = state;

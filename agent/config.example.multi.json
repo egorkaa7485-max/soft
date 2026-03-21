@@ -11,6 +11,7 @@
     ]
   },
   "target": {
+    "openOnConnectUrl": "https://example.com/",
     "preferUrlIncludes": "",
     "forceViewport": {
       "enabled": false,
