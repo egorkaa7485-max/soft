@@ -40,8 +40,10 @@
     "urlMatchMode": "hostpath",
     "virtualClipboard": true,
     "tabPickCacheMs": 8000,
-    "targetsListCacheMs": 50,
-    "mouseMoveThrottleMs": 33,
+    "targetsListCacheMs": 200,
+    "applyEventConcurrency": 16,
+    "viewportCacheMs": 900,
+    "mouseMoveThrottleMs": 48,
     "replicateInputValue": false,
     "clipboardDeferredInstall": true,
     "clipboardHookAllPagesOnConnect": false

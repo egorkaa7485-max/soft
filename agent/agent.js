@@ -547,6 +547,26 @@ function createStartLimiter(maxConcurrent) {
     });
 }
 
+/**
+ * Выполняет async-обработчик по каждому элементу с ограничением параллелизма.
+ * Без этого при 50–100+ профилях каждое событие давало Promise.all на сотни CDP-вызовов и лагало весь процесс.
+ */
+async function mapPool(concurrency, items, fn) {
+  const list = Array.isArray(items) ? items : [...items];
+  const limit = Math.max(1, Math.min(128, Math.floor(concurrency) || 1));
+  if (!list.length) return;
+  let idx = 0;
+  async function worker() {
+    while (true) {
+      const i = idx++;
+      if (i >= list.length) return;
+      await fn(list[i], i);
+    }
+  }
+  const workers = Math.min(limit, list.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+}
+
 async function dolphinLoginCached(dolphinBaseUrl, token) {
   if (Date.now() < dolphinLoginExpiresAt) return;
   await dolphinLogin(dolphinBaseUrl, token);
@@ -1004,12 +1024,17 @@ async function main() {
     /** Сколько мс держать выбранную вкладку для одного и того же href (ускоряет sync при множестве вкладок). 0 — без кэша. */
     tabPickCacheMs: Math.max(0, Number(cfg.sync?.tabPickCacheMs) || 8000),
     /** Кэш списка targets() на сессию — меньше обходов при десятках вкладок. 0 — каждый раз заново. */
-    targetsListCacheMs: Math.max(0, Number(cfg.sync?.targetsListCacheMs) || 50),
+    targetsListCacheMs: Math.max(0, Number(cfg.sync?.targetsListCacheMs) || 200),
+    /**
+     * Сколько профилей одновременно обрабатывают одно событие с сервера (CDP). Выше — быстрее реакция, но сильнее нагрузка на CPU/Chromium.
+     * При ~100 окнах разумно 12–24; по умолчанию 16.
+     */
+    applyEventConcurrency: Math.max(1, Math.min(128, Number(cfg.sync?.applyEventConcurrency) || 16)),
     /**
      * Пропуск лишних mousemove на агенте (мс). 0 — не ограничивать.
      * Клики/down/up/wheel не режутся — только move.
      */
-    mouseMoveThrottleMs: Math.max(0, Number(cfg.sync?.mouseMoveThrottleMs) || 33),
+    mouseMoveThrottleMs: Math.max(0, Number(cfg.sync?.mouseMoveThrottleMs) || 48),
     /**
      * После успешного CDP-подключения свернуть окно Chromium (через CDP Browser.setWindowBounds).
      * Имеет смысл вместе с bringAgentWindowToFront: false. На части сборок Dolphin может не сработать.
@@ -1636,7 +1661,10 @@ async function main() {
     return s._connectLoopPromise;
   }
 
-  const VIEWPORT_CACHE_MS = 350;
+  const VIEWPORT_CACHE_MS = Math.max(
+    200,
+    Math.min(5000, Number(cfg.sync?.viewportCacheMs) || 900)
+  );
 
   /** Одна CDP-сессия на страницу — мышь/колесо без лишних attach/detach на каждое событие */
   const pageCdpSessions = new WeakMap();
@@ -1647,6 +1675,7 @@ async function main() {
     if (s) return s;
     s = await page.target().createCDPSession();
     await s.send('Input.enable').catch(() => {});
+    await s.send('Page.enable').catch(() => {});
     pageCdpSessions.set(page, s);
     page.once('close', () => {
       pageCdpSessions.delete(page);
@@ -1686,9 +1715,8 @@ async function main() {
     };
 
     try {
-      const client = await page.target().createCDPSession();
+      const client = await getPageCdpSession(page);
       const lm = await client.send('Page.getLayoutMetrics');
-      await client.detach().catch(() => {});
       const lv = lm.layoutViewport;
       const cw = Math.round(Number(lv?.clientWidth) || 0);
       const ch = Math.round(Number(lv?.clientHeight) || 0);
@@ -2304,6 +2332,16 @@ async function main() {
     }
   }
 
+  let lastEnsureAllAt = 0;
+  const ENSURE_ALL_MIN_MS = 320;
+  /** Пока хотя бы один профиль в сети — не гоняем полный обход списка на каждое движение мыши. */
+  async function ensureAllConnectedSmart() {
+    const now = Date.now();
+    if (hasAnyBrowserConnected() && now - lastEnsureAllAt < ENSURE_ALL_MIN_MS) return;
+    lastEnsureAllAt = now;
+    await ensureAllConnected();
+  }
+
   /** Пока ни один профиль не подключён — события с главного буферизуем (клики не теряются при старте). */
   const pendingEventMessages = [];
   const MAX_PENDING_EVENTS = 100;
@@ -2336,59 +2374,57 @@ async function main() {
   async function applyIncomingEvent(msg) {
     const ev = msg.payload;
     try {
-      await ensureAllConnected();
-      await Promise.all(
-        profileIds.map(async (pid) => {
-          try {
-            const s = sessions[pid];
-            if (!s.browser) return;
+      await ensureAllConnectedSmart();
+      await mapPool(syncCfg.applyEventConcurrency, profileIds, async (pid) => {
+        try {
+          const s = sessions[pid];
+          if (!s.browser) return;
 
-            if (ev.eventType === 'copy') return;
+          if (ev.eventType === 'copy') return;
 
-            if (ev.eventType === 'tabs' && ev.kind === 'new') {
-              s.suppressTabBroadcastUntil = Date.now() + 2000;
-              const p = await s.browser.newPage();
-              s.page = p;
-              await maybeBringPageToFront(p);
-              return;
-            }
+          if (ev.eventType === 'tabs' && ev.kind === 'new') {
+            s.suppressTabBroadcastUntil = Date.now() + 2000;
+            const p = await s.browser.newPage();
+            s.page = p;
+            await maybeBringPageToFront(p);
+            return;
+          }
 
-            if (ev.eventType === 'chrome-ui' && ev.kind === 'focus-address-bar') {
-              const page = await pickPageForBrowserEvent(s, ev.href);
-              if (!page) return;
-              await applyFocusAddressBar(page);
-              return;
-            }
-
-            if (ev.eventType === 'navigate') {
-              await applyNavigate(ev, s);
-              return;
-            }
-
-            if (
-              ev.eventType === 'mouse' &&
-              ev.kind === 'move' &&
-              syncCfg.mouseMoveThrottleMs > 0
-            ) {
-              const now = Date.now();
-              const gap = now - (s._lastMouseMoveAt || 0);
-              if (gap < syncCfg.mouseMoveThrottleMs) return;
-              s._lastMouseMoveAt = now;
-            }
-
+          if (ev.eventType === 'chrome-ui' && ev.kind === 'focus-address-bar') {
             const page = await pickPageForBrowserEvent(s, ev.href);
             if (!page) return;
-
-            if (ev.eventType === 'mouse') await applyMouse(ev, page, pid);
-            else if (ev.eventType === 'wheel') await applyWheel(ev, page, pid);
-            else if (ev.eventType === 'key') await applyKeyWithVirtualClipboard(ev, page, pid);
-            else if (ev.eventType === 'input' && syncCfg.replicateInputValue) await applyInput(ev, page);
-          } catch (e) {
-            if (isBenignBrowserClosedError(e)) return;
-            console.error(`[${agentId}] profile ${pid} apply failed:`, e?.message ?? e);
+            await applyFocusAddressBar(page);
+            return;
           }
-        })
-      );
+
+          if (ev.eventType === 'navigate') {
+            await applyNavigate(ev, s);
+            return;
+          }
+
+          if (
+            ev.eventType === 'mouse' &&
+            ev.kind === 'move' &&
+            syncCfg.mouseMoveThrottleMs > 0
+          ) {
+            const now = Date.now();
+            const gap = now - (s._lastMouseMoveAt || 0);
+            if (gap < syncCfg.mouseMoveThrottleMs) return;
+            s._lastMouseMoveAt = now;
+          }
+
+          const page = await pickPageForBrowserEvent(s, ev.href);
+          if (!page) return;
+
+          if (ev.eventType === 'mouse') await applyMouse(ev, page, pid);
+          else if (ev.eventType === 'wheel') await applyWheel(ev, page, pid);
+          else if (ev.eventType === 'key') await applyKeyWithVirtualClipboard(ev, page, pid);
+          else if (ev.eventType === 'input' && syncCfg.replicateInputValue) await applyInput(ev, page);
+        } catch (e) {
+          if (isBenignBrowserClosedError(e)) return;
+          console.error(`[${agentId}] profile ${pid} apply failed:`, e?.message ?? e);
+        }
+      });
     } catch (e) {
       console.error(`[${agentId}] apply event failed:`, e?.message ?? e);
     }
