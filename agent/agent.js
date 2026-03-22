@@ -802,6 +802,11 @@ async function main() {
   }
   const runDolphinStart = createStartLimiter(maxConcurrentStarts);
   const runDolphinStop = createStartLimiter(maxConcurrentStops);
+  if (useLegacy) {
+    console.log(
+      `[${agentId}] dolphin: maxConcurrentApiCalls=${maxConcurrentStarts} (legacy — один лимит на start+stop; для ускорения уберите ключ и задайте maxConcurrentStarts / maxConcurrentStops)`
+    );
+  }
   const dolphinStartTimeoutMs = Math.max(15_000, Number(cfg.dolphin?.startTimeoutMs) || 45_000);
   const dolphinStopTimeoutMs = Math.max(5000, Number(cfg.dolphin?.stopTimeoutMs) || 12_000);
   const dolphinStopRetries = Math.max(1, Math.min(5, Number(cfg.dolphin?.stopRetries) || 2));
