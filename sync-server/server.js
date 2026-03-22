@@ -83,6 +83,7 @@ function broadcastToAgents(event, filter) {
   for (const [, c] of clients) {
     if (c.role !== 'agent') continue;
     if (!c.syncEnabled) continue;
+    if (filter?.excludeAgentId && c.id === filter.excludeAgentId) continue;
     if (filter?.agentIds?.length && !filter.agentIds.includes(c.id)) continue;
     send(c.ws, { type: 'event', payload: event });
   }
@@ -317,6 +318,12 @@ wss.on('connection', (ws) => {
         return;
       }
       broadcastToAgents(msg.payload);
+      return;
+    }
+
+    /** Вкладка «+» открыта вручную в окне Dolphin (агент) — рассылаем остальным агентам */
+    if (c.role === 'agent' && msg.type === 'agentForward') {
+      broadcastToAgents(msg.payload, { excludeAgentId: c.id });
       return;
     }
   });

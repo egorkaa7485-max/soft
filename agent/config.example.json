@@ -1,14 +1,10 @@
 {
   "agentId": "pc-001",
-  "serverWsUrl": "ws://YOUR_SERVER_IP:8888/ws",
+  "serverWsUrl": "ws://YOUR_SERVER_IP:8787/ws",
   "dolphin": {
     "baseUrl": "http://127.0.0.1:3001",
     "token": "PUT_YOUR_DOLPHIN_API_TOKEN_HERE",
-    "profileIds": [
-      "PROFILE_ID_1",
-      "PROFILE_ID_2",
-      "PROFILE_ID_3"
-    ],
+    "profileId": "YOUR_PROFILE_ID",
     "connectConcurrency": 3,
     "connectStaggerMs": 180,
     "maxConcurrentStarts": 2,
@@ -39,4 +35,3 @@
     "replicateInputValue": false
   }
 }
-

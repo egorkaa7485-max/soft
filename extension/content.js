@@ -9,15 +9,58 @@
     lastCommittedHref: typeof location !== 'undefined' ? location.href : ''
   };
 
+  function viewportSize() {
+    const vv = window.visualViewport;
+    const w =
+      (vv && vv.width) ||
+      window.innerWidth ||
+      (document.documentElement && document.documentElement.clientWidth) ||
+      1;
+    const h =
+      (vv && vv.height) ||
+      window.innerHeight ||
+      (document.documentElement && document.documentElement.clientHeight) ||
+      1;
+    return { w: Math.max(w, 1), h: Math.max(h, 1) };
+  }
+
   function nx(x) {
-    return window.innerWidth ? x / window.innerWidth : 0;
+    const { w } = viewportSize();
+    return w ? x / w : 0;
   }
 
   function ny(y) {
-    return window.innerHeight ? y / window.innerHeight : 0;
+    const { h } = viewportSize();
+    return h ? y / h : 0;
   }
 
+  let syncPort = null;
+
+  function connectSyncPort() {
+    try {
+      if (syncPort) return;
+      syncPort = chrome.runtime.connect({ name: 'dolphin-sync' });
+      syncPort.onDisconnect.addListener(() => {
+        syncPort = null;
+        setTimeout(connectSyncPort, 300);
+      });
+    } catch {
+      syncPort = null;
+      setTimeout(connectSyncPort, 500);
+    }
+  }
+
+  connectSyncPort();
+
   function send(payload) {
+    try {
+      if (syncPort) {
+        syncPort.postMessage({ type: 'sync_event', payload });
+        return;
+      }
+    } catch {
+      syncPort = null;
+    }
     try {
       chrome.runtime.sendMessage({ type: 'sync_event', payload });
     } catch {}
@@ -47,7 +90,8 @@
 
   window.addEventListener('mousemove', (e) => {
     const t = performance.now();
-    if (t - state.lastMoveTs < 40) return;
+    /** ~20 fps — меньше нагрузки на WS при многих агентах */
+    if (t - state.lastMoveTs < 50) return;
     state.lastMoveTs = t;
     send({
       eventType: 'mouse',

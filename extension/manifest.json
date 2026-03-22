@@ -6,6 +6,7 @@
   "permissions": [
     "storage",
     "tabs",
+    "windows",
     "webNavigation"
   ],
   "host_permissions": [
@@ -29,7 +30,16 @@
     }
   ],
   "action": {
-    "default_title": "Dolphin Sync Controller"
+    "default_title": "Dolphin Sync — клик: фокус строки URL на агентах"
+  },
+  "commands": {
+    "focus-agents-address-bar": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+U",
+        "mac": "Command+Shift+U"
+      },
+      "description": "Строка адреса на всех агентах (как Ctrl+L)"
+    }
   }
 }
 

@@ -1,5 +1,6 @@
 node_modules/
 agent/config.json
+extension.zip
 clipboard-logs/
 agent/clipboard-logs/
 npm-debug.log*

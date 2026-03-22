@@ -23,6 +23,29 @@ let isManualClose = false;
 let serverWsUrl = DEFAULT_SERVER_WS;
 let controllerId = DEFAULT_CONTROLLER_ID;
 
+/** Пока WebSocket не OPEN, события не теряем — сбрасываем после register при open. */
+const MAX_PENDING_OUT = 500;
+const pendingOut = [];
+
+function flushPendingOut() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  while (pendingOut.length) {
+    const payload = pendingOut.shift();
+    try {
+      ws.send(
+        JSON.stringify({
+          type: 'controllerEvent',
+          payload
+        })
+      );
+    } catch (e) {
+      log('flush pending failed', e?.message || e);
+      pendingOut.unshift(payload);
+      break;
+    }
+  }
+}
+
 function log(...args) {
   console.log('[sync-bg]', ...args);
 }
@@ -71,6 +94,7 @@ function connect() {
       id: controllerId,
       meta: { source: 'chrome-extension' }
     }));
+    flushPendingOut();
   });
 
   ws.addEventListener('close', () => {
@@ -84,11 +108,23 @@ function connect() {
 }
 
 function sendEventToServer(payload) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: 'controllerEvent',
-    payload
-  }));
+  if (!payload) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (pendingOut.length < MAX_PENDING_OUT) pendingOut.push(payload);
+    else log('pending queue full, drop event');
+    return;
+  }
+  try {
+    ws.send(
+      JSON.stringify({
+        type: 'controllerEvent',
+        payload
+      })
+    );
+  } catch (e) {
+    log('send failed', e?.message || e);
+    if (pendingOut.length < MAX_PENDING_OUT) pendingOut.push(payload);
+  }
 }
 
 function emitTabSelect(tabId, url) {
@@ -115,6 +151,16 @@ chrome.runtime.onStartup.addListener(async () => {
   await loadSettings();
   await initActiveTabTracking();
   connect();
+});
+
+/** Долгоживущий канал content ↔ service worker (MV3): события не теряются при «сон» SW. */
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'dolphin-sync') return;
+  port.onMessage.addListener((message) => {
+    if (message && message.type === 'sync_event' && message.payload) {
+      sendEventToServer(message.payload);
+    }
+  });
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -159,11 +205,23 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   } catch {}
 });
 
-/** Новая вкладка (+) в активном окне */
+/** Переключили окно Chrome — синхронизируем активную вкладку с агентами */
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId });
+    if (tab?.id && tab.url) emitTabSelect(tab.id, tab.url);
+  } catch {}
+});
+
+/** Новая вкладка (+) в любом окне Chrome с этим расширением (не только сфокусированном) */
 chrome.tabs.onCreated.addListener(async (tab) => {
   try {
-    const w = await chrome.windows.get(tab.windowId);
-    if (!w.focused) return;
+    /** Чтобы при первом переходе был fromHref (иначе strict на агенте раньше блокировал goto). */
+    if (tab?.id != null) {
+      const initial = tab.pendingUrl || tab.url || '';
+      if (initial) tabIdToUrl.set(tab.id, initial);
+    }
     sendEventToServer({
       eventType: 'tabs',
       kind: 'new',
@@ -215,6 +273,27 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   });
   tabIdToUrl.set(tabId, u);
   lastActiveTabUrl = u;
+});
+
+/** Клик по иконке расширения — на агентах Ctrl+L / Cmd+L (омнибар не в content script). */
+chrome.action.onClicked.addListener(() => {
+  sendEventToServer({
+    eventType: 'chrome-ui',
+    kind: 'focus-address-bar',
+    ts: Date.now(),
+    href: ''
+  });
+});
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command === 'focus-agents-address-bar') {
+    sendEventToServer({
+      eventType: 'chrome-ui',
+      kind: 'focus-address-bar',
+      ts: Date.now(),
+      href: ''
+    });
+  }
 });
 
 loadSettings().then(async () => {
