@@ -1,6 +1,6 @@
 {
   "agentId": "pc-001",
-  "serverWsUrl": "wss://soft-sage.vercel.app/ws",
+  "serverWsUrl": "wss://soft-production-fa8d.up.railway.app/ws",
   "dolphin": {
     "baseUrl": "http://127.0.0.1:3001",
     "token": "PUT_YOUR_DOLPHIN_API_TOKEN_HERE",

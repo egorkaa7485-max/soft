@@ -17,7 +17,7 @@
 
 По умолчанию в `background.js` стоит:
 
-- `wss://soft-sage.vercel.app/ws`
+- `wss://soft-production-fa8d.up.railway.app/ws`
 
 Если домен другой, поменяйте `DEFAULT_SERVER_WS` в `background.js`, затем нажмите **Reload** у расширения в `chrome://extensions`.
 
