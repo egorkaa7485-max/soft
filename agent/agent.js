@@ -44,6 +44,46 @@ function coercePuppeteerWaitUntil(w) {
 let dolphinLoginExpiresAt = 0;
 const DOLPHIN_LOGIN_TTL_MS = 25 * 60 * 1000;
 
+/** Без кэша каждый poll каждого профиля заново качает весь /running (сотни MB JSON → минуты на 2 профиля). */
+let dolphinRunningListCache = { at: 0, data: null };
+let dolphinRunningListInflight = null;
+const DOLPHIN_RUNNING_CACHE_MS =
+  Number(process.env.AGENT_RUNNING_CACHE_MS) >= 400 ? Number(process.env.AGENT_RUNNING_CACHE_MS) : 2500;
+
+async function dolphinFetchRunningListRaw(dolphinBaseUrl) {
+  const urls = [
+    `${dolphinBaseUrl}/v1.0/browser_profiles/running`,
+    `${dolphinBaseUrl}/v1.0/browser_profiles?status=running&limit=1000&page=1`
+  ];
+  for (const url of urls) {
+    try {
+      const r = await axios.get(url, { timeout: 15_000, validateStatus: (s) => s < 600 });
+      if (r.data != null) return r.data;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+async function dolphinGetCachedRunningList(dolphinBaseUrl) {
+  const now = Date.now();
+  if (dolphinRunningListCache.data != null && now - dolphinRunningListCache.at < DOLPHIN_RUNNING_CACHE_MS) {
+    return dolphinRunningListCache.data;
+  }
+  if (dolphinRunningListInflight) return dolphinRunningListInflight;
+  dolphinRunningListInflight = (async () => {
+    try {
+      const data = await dolphinFetchRunningListRaw(dolphinBaseUrl);
+      if (data != null) dolphinRunningListCache = { at: Date.now(), data };
+      return data;
+    } finally {
+      dolphinRunningListInflight = null;
+    }
+  })();
+  return dolphinRunningListInflight;
+}
+
 function normalizeUrlForMatch(url, mode) {
   try {
     const u = new URL(url);
@@ -370,33 +410,28 @@ function dolphinPickAutomationUnderProfileId(data, profileId, depth = 0) {
 
 /** Попытка получить CDP для уже запущенного профиля без stop/start. */
 async function dolphinTryGetRunningAutomation(dolphinBaseUrl, profileId) {
-  /** Без повторного /start — только данные профиля (часто там же port/ws для running). */
   const urls = [
     `${dolphinBaseUrl}/v1.0/browser_profiles/${encodeURIComponent(profileId)}`,
     `${dolphinBaseUrl}/v1.0/browser_profiles/${encodeURIComponent(profileId)}/automation`
   ];
-  for (const url of urls) {
-    try {
-      const r = await axios.get(url, { timeout: 4000, validateStatus: (s) => s < 600 });
-      const auto = dolphinPickAutomationDeep(r.data);
-      if (auto) return auto;
-    } catch {
-      /* ignore */
-    }
+  const settled = await Promise.allSettled(
+    urls.map((url) =>
+      axios.get(url, { timeout: 3500, validateStatus: (s) => s < 600 }).then((r) => r.data)
+    )
+  );
+  for (const s of settled) {
+    if (s.status !== 'fulfilled' || !s.value) continue;
+    const auto = dolphinPickAutomationDeep(s.value);
+    if (auto) return auto;
   }
-  /** Список running иногда содержит ws для каждого id, когда одиночный GET ещё пустой. */
-  const runningUrls = [
-    `${dolphinBaseUrl}/v1.0/browser_profiles/running`,
-    `${dolphinBaseUrl}/v1.0/browser_profiles?status=running&limit=1000&page=1`
-  ];
-  for (const url of runningUrls) {
-    try {
-      const r = await axios.get(url, { timeout: 3500, validateStatus: (s) => s < 600 });
-      const scoped = dolphinPickAutomationUnderProfileId(r.data, profileId);
+  try {
+    const d = await dolphinGetCachedRunningList(dolphinBaseUrl);
+    if (d) {
+      const scoped = dolphinPickAutomationUnderProfileId(d, profileId);
       if (scoped) return scoped;
-    } catch {
-      /* ignore */
     }
+  } catch {
+    /* ignore */
   }
   return null;
 }
@@ -588,50 +623,99 @@ async function dolphinStopProfileWithRetries(dolphinBaseUrl, profileId, stopTime
   throw lastErr;
 }
 
-async function dolphinListProfiles(dolphinBaseUrl) {
-  const urls = [
-    `${dolphinBaseUrl}/v1.0/browser_profiles?limit=1000&page=1`,
-    `${dolphinBaseUrl}/v1.0/browser_profiles`,
-    `${dolphinBaseUrl}/v1.0/browser_profiles/running`,
-    `${dolphinBaseUrl}/v1.0/browser_profiles?status=running&limit=1000&page=1`
-  ];
-  for (const url of urls) {
-    try {
-      const r = await axios.get(url, { timeout: 30_000 });
-      const d = r.data;
-      const items = Array.isArray(d?.data)
-        ? d.data
-        : (Array.isArray(d?.browserProfiles)
-          ? d.browserProfiles
-          : (Array.isArray(d) ? d : []));
-      if (items.length) {
-        return items;
-      }
-    } catch {}
-  }
+/** Достаёт массив профилей из типичных ответов Dolphin API. */
+function extractProfileArrayFromListResponse(d) {
+  if (!d) return [];
+  if (Array.isArray(d)) return d;
+  if (Array.isArray(d.data)) return d.data;
+  if (Array.isArray(d.browserProfiles)) return d.browserProfiles;
+  if (Array.isArray(d.items)) return d.items;
   return [];
 }
 
-async function dolphinListRunningIds(dolphinBaseUrl) {
-  const urls = [
-    `${dolphinBaseUrl}/v1.0/browser_profiles/running`,
-    `${dolphinBaseUrl}/v1.0/browser_profiles?status=running&limit=1000&page=1`
-  ];
-  for (const url of urls) {
-    try {
-      const r = await axios.get(url, { timeout: 30_000 });
-      const d = r.data;
-      if (d && typeof d === 'object' && !Array.isArray(d)) {
-        const keys = Object.keys(d).filter((k) => /^\d+$/.test(k) || /^[a-z0-9-]{6,}$/i.test(k));
-        if (keys.length) return keys;
-      }
-      if (Array.isArray(d?.data)) {
-        const ids = d.data.map((p) => pickProfileId(p)).filter(Boolean);
-        if (ids.length) return [...new Set(ids)];
-      }
-    } catch {}
+/** Ответ `/browser_profiles/running` иногда объект id → payload. */
+function extractIdsFromRunningMapObject(d) {
+  const ids = new Set();
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return [];
+  for (const k of Object.keys(d)) {
+    if (/^\d+$/.test(k)) ids.add(k);
+    else if (/^[a-f0-9-]{36}$/i.test(k)) ids.add(k);
   }
-  return [];
+  for (const v of Object.values(d)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const id = pickProfileId(v);
+      if (id) ids.add(String(id));
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Все запущенные profileId: /running + постранично status=running (раньше был только page=1 — терялись сотни окон).
+ */
+async function dolphinListAllRunningProfileIds(dolphinBaseUrl, dolphinCfg = {}) {
+  const pageLimit = Math.max(50, Math.min(1000, Number(dolphinCfg.listRunningPageLimit) || 500));
+  const maxPages = Math.max(1, Math.min(500, Number(dolphinCfg.listRunningMaxPages) || 200));
+  const ids = new Set();
+
+  try {
+    const r = await axios.get(`${dolphinBaseUrl}/v1.0/browser_profiles/running`, {
+      timeout: 90_000,
+      validateStatus: (s) => s < 600
+    });
+    const d = r.data;
+    for (const id of extractIdsFromRunningMapObject(d)) ids.add(String(id));
+    for (const p of extractProfileArrayFromListResponse(d)) {
+      const id = pickProfileId(p);
+      if (id) ids.add(String(id));
+    }
+  } catch {
+    /* ignore */
+  }
+
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${dolphinBaseUrl}/v1.0/browser_profiles?status=running&limit=${pageLimit}&page=${page}`;
+    try {
+      const r = await axios.get(url, { timeout: 90_000, validateStatus: (s) => s < 600 });
+      const items = extractProfileArrayFromListResponse(r.data);
+      if (!items.length) break;
+      for (const p of items) {
+        const id = pickProfileId(p);
+        if (id) ids.add(String(id));
+      }
+      if (items.length < pageLimit) break;
+    } catch {
+      break;
+    }
+  }
+
+  return [...ids];
+}
+
+/** Все профили постранично (fallback для auto-discover). */
+async function dolphinListAllProfilesPaginated(dolphinBaseUrl, dolphinCfg = {}) {
+  const pageLimit = Math.max(50, Math.min(1000, Number(dolphinCfg.listProfilesPageLimit) || 1000));
+  const maxPages = Math.max(1, Math.min(500, Number(dolphinCfg.listProfilesMaxPages) || 100));
+  const all = [];
+  const seen = new Set();
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${dolphinBaseUrl}/v1.0/browser_profiles?limit=${pageLimit}&page=${page}`;
+    try {
+      const r = await axios.get(url, { timeout: 90_000, validateStatus: (s) => s < 600 });
+      const items = extractProfileArrayFromListResponse(r.data);
+      if (!items.length) break;
+      for (const p of items) {
+        const id = pickProfileId(p);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        all.push(p);
+      }
+      if (items.length < pageLimit) break;
+    } catch {
+      break;
+    }
+  }
+  return all;
 }
 
 function pickProfileId(profile) {
@@ -693,7 +777,7 @@ async function main() {
 
   async function discoverProfileIdsOnce() {
     await dolphinLoginCached(dolphinBaseUrl, dolphinToken);
-    const runningIds = await dolphinListRunningIds(dolphinBaseUrl);
+    const runningIds = await dolphinListAllRunningProfileIds(dolphinBaseUrl, cfg.dolphin);
     if (runningIds.length) {
       cfg.dolphin.profileIds = [...new Set(runningIds)];
       saveConfig(cfg);
@@ -701,7 +785,7 @@ async function main() {
       return cfg.dolphin.profileIds;
     }
 
-    const profiles = await dolphinListProfiles(dolphinBaseUrl);
+    const profiles = await dolphinListAllProfilesPaginated(dolphinBaseUrl, cfg.dolphin);
     const discovered = profiles
       .filter((p) => isRunningProfile(p))
       .map((p) => pickProfileId(p))
@@ -754,9 +838,34 @@ async function main() {
       console.log(`[${agentId}] auto-discover skipped: ${e?.message ?? e}`);
     }
   } else if (autoDiscover && explicitProfileIdsFromConfig) {
-    console.log(
-      `[${agentId}] auto-discover: в конфиге задан profileIds/profileId (${profileIds.length} шт.) — список не перезаписываем`
-    );
+    /**
+     * Раньше при заданном profileIds все остальные запущенные окна игнорировались (остались бы только ~10–20 id из конфига).
+     * По умолчанию объединяем: конфиг ∪ все running из API (с пагинацией). Отключить: "autoDiscoverMergeRunningProfileIds": false
+     */
+    const mergeRunning = cfg.dolphin.autoDiscoverMergeRunningProfileIds !== false;
+    if (mergeRunning) {
+      try {
+        await dolphinLoginCached(dolphinBaseUrl, dolphinToken);
+        const runningIds = await dolphinListAllRunningProfileIds(dolphinBaseUrl, cfg.dolphin);
+        if (runningIds.length) {
+          const before = profileIds.length;
+          profileIds = [...new Set([...profileIds.map(String), ...runningIds.map(String)])];
+          console.log(
+            `[${agentId}] auto-discover: к profileIds из конфига (${before} шт.) добавлены все запущенные из API → всего ${profileIds.length} профилей`
+          );
+        } else {
+          console.log(
+            `[${agentId}] auto-discover: API вернул 0 запущенных id, подключаем только список из конфига (${profileIds.length} шт.)`
+          );
+        }
+      } catch (e) {
+        console.warn(`[${agentId}] auto-discover merge running: ${e?.message ?? e}`);
+      }
+    } else {
+      console.log(
+        `[${agentId}] auto-discover: задан profileIds (${profileIds.length} шт.), merge выключен — только конфиг`
+      );
+    }
   }
 
   if (!profileIds.length) throw new Error('No dolphin.profileIds or dolphin.profileId defined in config');
@@ -774,18 +883,26 @@ async function main() {
    * never = не goto.
    */
   const openOnConnectMode = normalizeOpenOnConnectMode(cfg.target?.openOnConnectMode);
-  /** Пачки при старте: больше — быстрее «все окна», но выше пиковая нагрузка на Dolphin/диск. */
-  const connectConcurrency = Math.max(1, Math.min(30, Number(cfg.dolphin?.connectConcurrency) || 3));
+  /**
+   * Сколько профилей подключаются **параллельно** (пул воркеров — без ожидания самого медленного в «пачке»).
+   * Для сотен уже открытых окон можно 40–80 (смотрите по CPU/RAM и стабильности Dolphin).
+   */
+  const connectConcurrency = Math.max(1, Math.min(120, Number(cfg.dolphin?.connectConcurrency) || 3));
   const connectStaggerMs = Math.max(0, Number(cfg.dolphin?.connectStaggerMs) || 180);
   /**
-   * Раздельные очереди: параллельные **stop** чаще ловили EBUSY/таймауты → stop по умолчанию 1.
-   * Параллельные **start** по разным profileId обычно безопаснее — по умолчанию 2 (ускоряет старт).
-   * Заданный `maxConcurrentApiCalls` — прежнее поведение: одно число на **оба** типа вызовов.
+   * Раздельные очереди: параллельные **stop** чаще ловили EBUSY → stop по умолчанию 1.
+   * **start** — до 32 параллельно (для сотен окон за минуты); при EBUSY снижайте.
+   * Заданный `maxConcurrentApiCalls` — прежнее: одно число на **оба** типа вызовов.
    */
-  const clampApi = (v, def) => {
+  const clampStarts = (v, def) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n < 1) return def;
-    return Math.max(1, Math.min(4, Math.floor(n)));
+    return Math.max(1, Math.min(32, Math.floor(n)));
+  };
+  const clampStops = (v, def) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 1) return def;
+    return Math.max(1, Math.min(8, Math.floor(n)));
   };
   const legacyRaw = cfg.dolphin?.maxConcurrentApiCalls;
   const useLegacy =
@@ -793,18 +910,26 @@ async function main() {
   let maxConcurrentStarts;
   let maxConcurrentStops;
   if (useLegacy) {
-    const v = clampApi(legacyRaw, 1);
+    /** Как раньше: одно число на start и stop, потолок 4. */
+    const n = Number(legacyRaw);
+    const v = Number.isFinite(n) && n >= 1 ? Math.max(1, Math.min(4, Math.floor(n))) : 1;
     maxConcurrentStarts = v;
     maxConcurrentStops = v;
   } else {
-    maxConcurrentStarts = clampApi(cfg.dolphin?.maxConcurrentStarts, 2);
-    maxConcurrentStops = clampApi(cfg.dolphin?.maxConcurrentStops, 1);
+    maxConcurrentStarts = clampStarts(cfg.dolphin?.maxConcurrentStarts, 2);
+    maxConcurrentStops = clampStops(cfg.dolphin?.maxConcurrentStops, 1);
   }
   const runDolphinStart = createStartLimiter(maxConcurrentStarts);
   const runDolphinStop = createStartLimiter(maxConcurrentStops);
   if (useLegacy) {
     console.log(
       `[${agentId}] dolphin: maxConcurrentApiCalls=${maxConcurrentStarts} (legacy — один лимит на start+stop; для ускорения уберите ключ и задайте maxConcurrentStarts / maxConcurrentStops)`
+    );
+  }
+  if (profileIds.length >= 15 && (connectConcurrency < 8 || (useLegacy && Number(legacyRaw) <= 2))) {
+    console.warn(
+      `[${agentId}] ⚠ Медленный конфиг: ${profileIds.length} профилей, connectConcurrency=${connectConcurrency}. ` +
+        `Для сотен окон уберите maxConcurrentApiCalls, поставьте connectConcurrency 50+, maxConcurrentStarts 16+, connectStaggerMs 20–50.`
     );
   }
   const dolphinStartTimeoutMs = Math.max(15_000, Number(cfg.dolphin?.startTimeoutMs) || 45_000);
@@ -884,8 +1009,41 @@ async function main() {
      * Пропуск лишних mousemove на агенте (мс). 0 — не ограничивать.
      * Клики/down/up/wheel не режутся — только move.
      */
-    mouseMoveThrottleMs: Math.max(0, Number(cfg.sync?.mouseMoveThrottleMs) || 33)
+    mouseMoveThrottleMs: Math.max(0, Number(cfg.sync?.mouseMoveThrottleMs) || 33),
+    /**
+     * После успешного CDP-подключения свернуть окно Chromium (через CDP Browser.setWindowBounds).
+     * Имеет смысл вместе с bringAgentWindowToFront: false. На части сборок Dolphin может не сработать.
+     */
+    minimizeAgentWindowAfterConnect: cfg.sync?.minimizeAgentWindowAfterConnect === true,
+    /**
+     * Не ждать установки clipboard-хуков перед следующим профилем в пуле (мышь/клавиатура CDP уже работают).
+     */
+    clipboardDeferredInstall: cfg.sync?.clipboardDeferredInstall !== false,
+    /**
+     * true — на коннекте обойти все вкладки (долго). false — только активная s.page + новые (targetcreated).
+     */
+    clipboardHookAllPagesOnConnect: cfg.sync?.clipboardHookAllPagesOnConnect === true,
+    clipboardHookParallelChunk: Math.max(4, Math.min(32, Number(cfg.sync?.clipboardHookParallelChunk) || 12))
   };
+
+  /** Свернуть окно браузера профиля (если CDP разрешает). */
+  async function minimizeAgentBrowserWindow(page) {
+    if (!page || !syncCfg.minimizeAgentWindowAfterConnect) return;
+    try {
+      const target = page.target();
+      const targetId = target._targetId || target._getTargetInfo?.()?.targetId;
+      if (!targetId) return;
+      const session = await page.createCDPSession();
+      const { windowId } = await session.send('Browser.getWindowForTarget', { targetId });
+      await session.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { windowState: 'minimized' }
+      });
+      await session.detach().catch(() => {});
+    } catch {
+      /* ignore — не все сборки Chromium/Dolphin отдают Browser domain */
+    }
+  }
 
   /** Если bringAgentWindowToFront: false — не вызываем bringToFront (окна остаются свёрнутыми/под другими). */
   async function maybeBringPageToFront(page) {
@@ -1052,7 +1210,7 @@ async function main() {
     }
   }
 
-  async function installClipboardHooksForBrowser(browser, profileId) {
+  async function installClipboardHooksForBrowser(browser, profileId, hookOpts = {}) {
     const hook = async (p) => {
       try {
         if (p?.isClosed?.()) return;
@@ -1063,10 +1221,18 @@ async function main() {
       }
     };
 
+    let pages = [];
     try {
-      for (const p of await browser.pages()) await hook(p);
+      pages = Array.isArray(hookOpts.pagesOnly)
+        ? hookOpts.pagesOnly.filter(Boolean)
+        : await browser.pages();
     } catch {
-      /* ignore */
+      pages = [];
+    }
+
+    const chunk = syncCfg.clipboardHookParallelChunk;
+    for (let i = 0; i < pages.length; i += chunk) {
+      await Promise.all(pages.slice(i, i + chunk).map((p) => hook(p)));
     }
 
     browser.on('targetcreated', async (target) => {
@@ -1428,12 +1594,27 @@ async function main() {
             console.log(`[${agentId}] profile ${profileId} → onlyExisting: goto не делаем`);
           }
         }
-        if (syncCfg.virtualClipboard || syncCfg.clipboardLogToFile) {
-          await installClipboardHooksForBrowser(browser, profileId);
-        }
         installTabBroadcastForBrowser(browser, profileId);
         console.log(`[${agentId}] profile ${profileId} connected`);
+        await minimizeAgentBrowserWindow(s.page);
         flushPendingIfReady();
+
+        if (syncCfg.virtualClipboard || syncCfg.clipboardLogToFile) {
+          const hookPagesOnly = syncCfg.clipboardHookAllPagesOnConnect
+            ? undefined
+            : s.page && !s.page.isClosed?.()
+              ? [s.page]
+              : [];
+          const clipOpts = Array.isArray(hookPagesOnly) ? { pagesOnly: hookPagesOnly } : {};
+          const clipJob = installClipboardHooksForBrowser(browser, profileId, clipOpts);
+          if (syncCfg.clipboardDeferredInstall) {
+            void clipJob.catch((e) =>
+              console.warn(`[${agentId}] clipboard hooks (фон):`, e?.message ?? e)
+            );
+          } else {
+            await clipJob;
+          }
+        }
         return;
       } catch (e) {
         console.error(`[${agentId}] profile ${profileId} connect failed:`, formatDolphinConnectError(e));
@@ -2299,16 +2480,19 @@ async function main() {
 
   void (async () => {
     console.log(
-      `[${agentId}] connecting ${profileIds.length} profile(s), batchConcurrency=${connectConcurrency}, dolphinApi start=${maxConcurrentStarts} stop=${maxConcurrentStops}...`
+      `[${agentId}] connecting ${profileIds.length} profile(s), pool=${connectConcurrency} parallel, dolphinApi start=${maxConcurrentStarts} stop=${maxConcurrentStops}...`
     );
-    for (let i = 0; i < profileIds.length; i += connectConcurrency) {
-      const batch = profileIds.slice(i, i + connectConcurrency);
-      await Promise.all(
-        batch.map((pid, j) =>
-          sleep(j * connectStaggerMs).then(() => connectProfileLoop(pid))
-        )
-      );
+    let nextIdx = 0;
+    async function poolWorker() {
+      while (true) {
+        const idx = nextIdx++;
+        if (idx >= profileIds.length) return;
+        const pid = profileIds[idx];
+        if (connectStaggerMs > 0) await sleep((idx % connectConcurrency) * connectStaggerMs);
+        await connectProfileLoop(pid);
+      }
     }
+    await Promise.all(Array.from({ length: connectConcurrency }, () => poolWorker()));
     console.log(`[${agentId}] all profiles initial connect finished`);
   })();
 }

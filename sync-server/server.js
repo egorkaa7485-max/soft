@@ -2,6 +2,7 @@ import express from 'express';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import os from 'node:os';
 import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
@@ -12,6 +13,21 @@ const CLIPBOARD_LOG_DIR = process.env.CLIPBOARD_LOG_DIR
 
 function safeClipboardFileId(id) {
   return String(id || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+}
+
+/** Не loopback IPv4 — подсказка, какой URL дать агентам в LAN (у ПК может быть несколько интерфейсов). */
+function listLanIPv4() {
+  const out = [];
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const info of ifaces[name] || []) {
+      const fam = info.family;
+      if (fam !== 'IPv4' && fam !== 4) continue;
+      if (info.internal) continue;
+      out.push({ name, address: info.address });
+    }
+  }
+  return out;
 }
 
 function appendClipboardLogFile(windowId, text, kind = 'copy') {
@@ -337,9 +353,20 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Sync server listening: http://0.0.0.0:${PORT}`);
-  console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
-  console.log(`Clipboard logs (главное окно): ${CLIPBOARD_LOG_DIR}/*.log`);
-});
+if (!process.env.VERCEL) {
+  server.listen(PORT, () => {
+    console.log(`Sync server listening: http://0.0.0.0:${PORT}`);
+    console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
+    const lan = listLanIPv4();
+    if (lan.length) {
+      console.log('С этой машины по LAN (выберите адрес той же подсети, что и у агента):');
+      for (const { name, address } of lan) {
+        console.log(`  http://${address}:${PORT}/  |  ws://${address}:${PORT}/ws  (${name})`);
+      }
+    }
+    console.log(`Clipboard logs (главное окно): ${CLIPBOARD_LOG_DIR}/*.log`);
+  });
+}
+
+export default app;
 

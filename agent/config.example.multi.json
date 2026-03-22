@@ -1,6 +1,6 @@
 {
   "agentId": "pc-001",
-  "serverWsUrl": "ws://YOUR_SERVER_IP:8888/ws",
+  "serverWsUrl": "wss://soft-sage.vercel.app/ws",
   "dolphin": {
     "baseUrl": "http://127.0.0.1:3001",
     "token": "PUT_YOUR_DOLPHIN_API_TOKEN_HERE",
@@ -9,9 +9,13 @@
       "PROFILE_ID_2",
       "PROFILE_ID_3"
     ],
-    "connectConcurrency": 3,
-    "connectStaggerMs": 180,
-    "maxConcurrentStarts": 2,
+    "autoDiscoverRunningProfileIds": true,
+    "autoDiscoverMergeRunningProfileIds": true,
+    "listRunningPageLimit": 500,
+    "listRunningMaxPages": 200,
+    "connectConcurrency": 50,
+    "connectStaggerMs": 35,
+    "maxConcurrentStarts": 20,
     "maxConcurrentStops": 1,
     "startTimeoutMs": 45000,
     "stopTimeoutMs": 12000,
@@ -28,15 +32,19 @@
     }
   },
   "sync": {
-    "bringAgentWindowToFront": true,
+    "bringAgentWindowToFront": false,
+    "focusAddressBarForcesBringToFront": false,
+    "minimizeAgentWindowAfterConnect": true,
+    "mouseDispatchMode": "cdp",
     "strictUrlMatch": false,
     "urlMatchMode": "hostpath",
     "virtualClipboard": true,
-    "mouseDispatchMode": "cdp",
     "tabPickCacheMs": 8000,
     "targetsListCacheMs": 50,
     "mouseMoveThrottleMs": 33,
-    "replicateInputValue": false
+    "replicateInputValue": false,
+    "clipboardDeferredInstall": true,
+    "clipboardHookAllPagesOnConnect": false
   }
 }
 

@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "description": "Controller->Agents tab sync for Dolphin{anty} via CDP",
   "scripts": {
     "start": "node ./sync-server/server.js",

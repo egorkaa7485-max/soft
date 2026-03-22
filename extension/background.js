@@ -1,4 +1,4 @@
-const DEFAULT_SERVER_WS = 'wss://soft-production-e391.up.railway.app/ws';
+const DEFAULT_SERVER_WS = 'wss://soft-sage.vercel.app/ws';
 const DEFAULT_CONTROLLER_ID = 'controller-main';
 
 /** URL активной вкладки до переключения на другую вкладку */
