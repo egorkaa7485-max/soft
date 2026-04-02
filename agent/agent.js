@@ -1149,12 +1149,25 @@ async function main() {
         if (Date.now() < (s.suppressTabBroadcastUntil || 0)) return;
         await sleep(50);
         if (Date.now() < (s.suppressTabBroadcastUntil || 0)) return;
+
+        // Иногда Chromium создаёт промежуточные пустые страницы (about:blank / chrome://new*),
+        // и тогда форвардинг "tabs:new" создаёт каскад пустых вкладок в других профилях.
+        // Пропускаем такие случаи.
+        let href = '';
+        try {
+          href = String(target.url?.() || target.url?.() || '');
+        } catch {
+          href = '';
+        }
+        if (isBlankPageUrl(href)) return;
+
+        s.suppressTabBroadcastUntil = Date.now() + 1500;
         sendAgentForwardedEvent({
           eventType: 'tabs',
           kind: 'new',
           ts: Date.now(),
           sourceProfileId: profileId,
-          href: ''
+          href
         });
       } catch (e) {
         console.warn(`[${agentId}] tab forward:`, e?.message ?? e);
@@ -2383,6 +2396,40 @@ async function main() {
 
           if (ev.eventType === 'tabs' && ev.kind === 'new') {
             s.suppressTabBroadcastUntil = Date.now() + 2000;
+
+            const href = String(ev.href ?? '').trim();
+
+            // Если href уже известен — попробуем найти существующую вкладку,
+            // вместо того чтобы плодить newPage (особенно когда приходят повторные tabs:new).
+            if (href && !isBlankPageUrl(href)) {
+              const existing = await pickPageForBrowserEvent(s, href);
+              if (existing) {
+                s.page = existing;
+                return;
+              }
+            }
+
+            // Если вкладка ещё "пустая" (about:blank / chrome://new*),
+            // возьмём ближайшую blank-вкладку, а не будем каждый раз создавать новую.
+            if (isBlankPageUrl(href)) {
+              const targets = listPageTargetsCached(s.browser, s);
+              for (const t of targets) {
+                let u = '';
+                try {
+                  u = String(t.url?.() || '');
+                } catch {
+                  u = '';
+                }
+                if (!isBlankPageUrl(u)) continue;
+                const p = await t.page().catch(() => null);
+                if (p && !p.isClosed?.()) {
+                  s.page = p;
+                  await maybeBringPageToFront(p);
+                  return;
+                }
+              }
+            }
+
             const p = await s.browser.newPage();
             s.page = p;
             await maybeBringPageToFront(p);
