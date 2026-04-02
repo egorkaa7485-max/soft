@@ -2366,9 +2366,8 @@ async function main() {
       return;
     }
     const batch = pendingEventMessages.splice(0);
-    for (const m of batch) {
-      void applyIncomingEvent(m);
-    }
+    for (const m of batch) enqueueEvent(m);
+    scheduleDrain();
   }
 
   async function applyIncomingEvent(msg) {
@@ -2430,6 +2429,54 @@ async function main() {
     }
   }
 
+  // Чтобы не запускать applyIncomingEvent параллельно (когда накапливаются “несколько действий”),
+  // держим очередь событий и обрабатываем по одному.
+  // Для mouse.move дополнительно коалесим: в очереди остаётся только последнее перемещение.
+  const eventQueue = [];
+  let eventDrainInFlight = false;
+  let eventDrainScheduled = false;
+  const MAX_EVENT_QUEUE = 600;
+
+  function enqueueEvent(msg) {
+    const ev = msg?.payload;
+    if (ev?.eventType === 'mouse' && ev?.kind === 'move') {
+      const last = eventQueue[eventQueue.length - 1];
+      if (last?.payload?.eventType === 'mouse' && last?.payload?.kind === 'move') {
+        eventQueue[eventQueue.length - 1] = msg;
+        return;
+      }
+    }
+    if (eventQueue.length >= MAX_EVENT_QUEUE) eventQueue.shift();
+    eventQueue.push(msg);
+  }
+
+  function scheduleDrain() {
+    if (eventDrainScheduled || eventDrainInFlight) return;
+    eventDrainScheduled = true;
+    setTimeout(async () => {
+      eventDrainScheduled = false;
+      await drainEvents();
+    }, 0);
+  }
+
+  async function drainEvents() {
+    if (eventDrainInFlight) return;
+    eventDrainInFlight = true;
+    try {
+      while (eventQueue.length) {
+        if (!syncEnabled) {
+          eventQueue.length = 0;
+          return;
+        }
+        const m = eventQueue.shift();
+        await applyIncomingEvent(m);
+      }
+    } finally {
+      eventDrainInFlight = false;
+      if (eventQueue.length) scheduleDrain();
+    }
+  }
+
   async function onWsMessage(buf) {
     const msg = (() => {
       try { return JSON.parse(buf.toString('utf8')); } catch { return null; }
@@ -2460,7 +2507,8 @@ async function main() {
       schedulePendingFlush();
       return;
     }
-    await applyIncomingEvent(msg);
+    enqueueEvent(msg);
+    scheduleDrain();
   }
 
   function attachServerHandlers(socket) {
