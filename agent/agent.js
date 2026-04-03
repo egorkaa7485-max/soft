@@ -1294,41 +1294,31 @@ async function main() {
   }
 
   async function applyVirtualCopy(page, profileId) {
-    const ses = sessions[profileId];
     let text = '';
     try {
-      const { width, height } = await getViewport(page, profileId);
-      const lx = clamp01(ses?.lastPointer?.x ?? 0.5);
-      const ly = clamp01(ses?.lastPointer?.y ?? 0.5);
-      const cx = Math.round(lx * width);
-      const cy = Math.round(ly * height);
-      await page.mouse.move(cx, cy).catch(() => {});
-      text = await page.evaluate(({ px, py }) => {
-        try {
-          const hit = document.elementFromPoint(px, py);
-          if (hit && typeof hit.focus === 'function') hit.focus();
-        } catch {
-          /* ignore */
-        }
+      // Важно: копируем СВОЙ текст в каждом профиле.
+      // Не двигаем мышь по lastPointer (там могут быть разные/устаревшие координаты),
+      // а читаем текущую selection/activeElement прямо в этом Dolphin-окне.
+      text = await page.evaluate(() => {
         const ae = document.activeElement;
         if (ae instanceof HTMLInputElement || ae instanceof HTMLTextAreaElement) {
-          const v = ae.value;
+          const v = ae.value || '';
           const s = typeof ae.selectionStart === 'number' ? ae.selectionStart : 0;
           const e = typeof ae.selectionEnd === 'number' ? ae.selectionEnd : 0;
           if (e > s) return v.slice(s, e);
         }
         if (ae && ae.isContentEditable) {
-          const sel = window.getSelection();
+          const sel = window.getSelection?.();
           const str = sel ? sel.toString() : '';
           if (str) return str;
         }
         try {
-          const sel = window.getSelection();
+          const sel = window.getSelection?.();
           return sel ? sel.toString() : '';
         } catch {
           return '';
         }
-      }, { px: cx, py: cy });
+      });
     } catch {
       return;
     }
