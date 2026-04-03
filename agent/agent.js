@@ -1036,6 +1036,11 @@ async function main() {
      */
     mouseMoveThrottleMs: Math.max(0, Number(cfg.sync?.mouseMoveThrottleMs) || 48),
     /**
+     * true — при открытии вкладки в окне Dolphin слать остальным агентам (agentForward).
+     * По умолчанию false: иначе возможна лавина вкладок (см. ретрансляцию tabs:new на сервере).
+     */
+    forwardAgentTabsNew: cfg.sync?.forwardAgentTabsNew === true,
+    /**
      * После успешного CDP-подключения свернуть окно Chromium (через CDP Browser.setWindowBounds).
      * Имеет смысл вместе с bringAgentWindowToFront: false. На части сборок Dolphin может не сработать.
      */
@@ -1632,7 +1637,7 @@ async function main() {
             console.log(`[${agentId}] profile ${profileId} → onlyExisting: goto не делаем`);
           }
         }
-        installTabBroadcastForBrowser(browser, profileId);
+        if (syncCfg.forwardAgentTabsNew) installTabBroadcastForBrowser(browser, profileId);
         console.log(`[${agentId}] profile ${profileId} connected`);
         await minimizeAgentBrowserWindow(s.page);
         flushPendingIfReady();

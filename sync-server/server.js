@@ -337,8 +337,15 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /** Вкладка «+» открыта вручную в окне Dolphin (агент) — рассылаем остальным агентам */
+    /**
+     * Ретрансляция событий между агентами (например вкладка «+» в Dolphin).
+     * ВАЖНО: `tabs:new` от агентов НЕ ретранслируем — иначе петля: sync → newPage →
+     * targetcreated → agentForward → другие агенты → снова newPage → лавина about:blank.
+     * Новые вкладки с главного идут только через controller → controllerEvent.
+     */
     if (c.role === 'agent' && msg.type === 'agentForward') {
+      const p = msg.payload;
+      if (p && p.eventType === 'tabs' && p.kind === 'new') return;
       broadcastToAgents(msg.payload, { excludeAgentId: c.id });
       return;
     }
@@ -354,6 +361,16 @@ wss.on('connection', (ws) => {
 });
 
 if (!process.env.VERCEL) {
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[sync-server] Порт ${PORT} уже занят (другой экземпляр сервера или программа).`);
+      console.error(`  Windows: netstat -ano | findstr :${PORT}  →  taskkill /PID <pid> /F`);
+      console.error(`  Или другой порт (bash): SYNC_SERVER_PORT=8788 npm run server`);
+      console.error(`  (cmd.exe): set SYNC_SERVER_PORT=8788 && npm run server`);
+      process.exit(1);
+    }
+    throw err;
+  });
   server.listen(PORT, () => {
     console.log(`Sync server listening: http://0.0.0.0:${PORT}`);
     console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
