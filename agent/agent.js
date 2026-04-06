@@ -308,6 +308,48 @@ function keyFromSyncEvent(ev) {
   return code;
 }
 
+/** CDP Input.dispatchKeyEvent: Alt=1, Control=2, Meta=4, Shift=8 (как в Puppeteer CdpKeyboard) */
+function keyModifiersMask(ev) {
+  let m = 0;
+  if (ev?.alt) m |= 1;
+  if (ev?.ctrl) m |= 2;
+  if (ev?.meta) m |= 4;
+  if (ev?.shift) m |= 8;
+  return m;
+}
+
+/**
+ * Печатный символ с главного (в т.ч. кириллица) — через Input.insertText, без US KeyboardLayout Puppeteer.
+ * Работает и когда окно Dolphin в фоне (в отличие от page.keyboard).
+ */
+function isInsertTextKeydown(ev) {
+  if (!ev || ev.kind !== 'down') return false;
+  if (ev.ctrl || ev.meta || ev.alt) return false;
+  const k = ev.key;
+  if (k == null || k === '') return false;
+  if (k === 'Enter' || k === 'Tab' || k === 'Escape' || k === 'Backspace' || k === 'Delete') return false;
+  if (k.length === 1) {
+    const c = k.charCodeAt(0);
+    if (c < 0x20) return false;
+    return true;
+  }
+  return [...k].length === 1;
+}
+
+/** Для insertText keyUp с главного не шлём — иначе дублирование/артефакты */
+function skipKeyUpAfterInsertText(ev) {
+  if (!ev || ev.kind !== 'up') return false;
+  if (ev.ctrl || ev.meta || ev.alt) return false;
+  const k = ev.key;
+  if (k == null || k === '') return false;
+  if (k.length === 1) {
+    const c = k.charCodeAt(0);
+    if (c < 0x20) return false;
+    return true;
+  }
+  return [...k].length === 1;
+}
+
 function isDolphinRateLimitError(e) {
   const st = e?.response?.status;
   const body = JSON.stringify(e?.response?.data ?? '');
@@ -1376,16 +1418,40 @@ async function main() {
 
   async function applyVirtualPaste(page, profileId) {
     const text = clipboardByProfile[profileId] ?? '';
+    const ses = sessions[profileId];
+    let px = null;
+    let py = null;
     try {
-      await page.evaluate((ins) => {
-        const payload = String(ins ?? '');
-        const el = document.activeElement;
-        if (!el) return;
-        if (el.isContentEditable) {
-          document.execCommand('insertText', false, payload);
-          return;
-        }
-        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      const { width, height } = await getViewport(page, profileId);
+      const lx = clamp01(ses?.lastPointer?.x ?? 0.5);
+      const ly = clamp01(ses?.lastPointer?.y ?? 0.5);
+      px = Math.round(lx * width);
+      py = Math.round(ly * height);
+    } catch {
+      /* ignore */
+    }
+    try {
+      await page.evaluate(
+        ({ ins, px: ix, py: iy }) => {
+          const payload = String(ins ?? '');
+          const pickEditable = () => {
+            const el = document.activeElement;
+            if (!el) return null;
+            if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el;
+            if (el.isContentEditable) return el;
+            return null;
+          };
+          let el = pickEditable();
+          if (!el && typeof ix === 'number' && typeof iy === 'number') {
+            const hit = document.elementFromPoint(ix, iy);
+            if (hit && typeof hit.focus === 'function') hit.focus();
+            el = pickEditable();
+          }
+          if (!el) return;
+          if (el.isContentEditable) {
+            document.execCommand('insertText', false, payload);
+            return;
+          }
           const ta = el;
           const start = typeof ta.selectionStart === 'number' ? ta.selectionStart : ta.value.length;
           const end = typeof ta.selectionEnd === 'number' ? ta.selectionEnd : ta.value.length;
@@ -1394,8 +1460,9 @@ async function main() {
           ta.selectionStart = ta.selectionEnd = start + payload.length;
           ta.dispatchEvent(new Event('input', { bubbles: true }));
           ta.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }, text);
+        },
+        { ins: text, px, py }
+      );
     } catch {
       /* ignore */
     }
@@ -1441,7 +1508,7 @@ async function main() {
       return;
     }
 
-    await applyKey(ev, page);
+    await applyKey(ev, page, profileId);
   }
 
   async function connectProfileLoop(profileId) {
@@ -2154,16 +2221,41 @@ async function main() {
     }
   }
 
-  async function applyKey(ev, page) {
-    const k = keyFromSyncEvent(ev);
-    if (!k) return;
+  async function applyKey(ev, page, profileId) {
     try {
-      if (ev.kind === 'down') await page.keyboard.down(k);
-      if (ev.kind === 'up') await page.keyboard.up(k);
+      const client = await getPageCdpSession(page);
+      const mods = keyModifiersMask(ev);
+
+      if (isInsertTextKeydown(ev)) {
+        await client.send('Input.insertText', { text: ev.key });
+        return;
+      }
+      if (skipKeyUpAfterInsertText(ev)) return;
+
+      const k = keyFromSyncEvent(ev);
+      if (!k && !(ev.key || ev.code)) return;
+      const key = ev.key != null && String(ev.key) !== '' ? String(ev.key) : k || '';
+      const code = typeof ev.code === 'string' ? ev.code : '';
+
+      await client.send('Input.dispatchKeyEvent', {
+        type: ev.kind === 'down' ? 'rawKeyDown' : 'keyUp',
+        modifiers: mods,
+        key,
+        code
+      });
     } catch (e) {
       const m = String(e?.message ?? e);
-      if (/detached|context was destroyed|Unknown key/i.test(m)) return;
-      throw e;
+      if (/detached|context was destroyed/i.test(m)) return;
+      const k = keyFromSyncEvent(ev);
+      if (!k) return;
+      try {
+        if (ev.kind === 'down') await page.keyboard.down(k);
+        if (ev.kind === 'up') await page.keyboard.up(k);
+      } catch (e2) {
+        const m2 = String(e2?.message ?? e2);
+        if (/detached|context was destroyed|Unknown key/i.test(m2)) return;
+        throw e2;
+      }
     }
   }
 
