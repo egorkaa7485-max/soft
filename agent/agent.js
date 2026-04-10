@@ -1032,11 +1032,10 @@ async function main() {
     clipboardLogToFile: cfg.sync?.clipboardLogToFile !== false,
     clipboardLogMaxChars,
     /**
-     * false (по умолчанию): не подставлять с главного полный `value` полей — иначе на всех профилях
-     * тот же текст, что на главном, и копирование «своего» фрагмента невозможно. Ввод идёт через клавиши.
-     * true — старое поведение: полная заливка value с главного (как раньше).
+     * true (по умолчанию): жёсткая синхронизация текста — подставляем полный `value` полей с главного.
+     * false — только клавиши, допускает расхождение DOM/фокуса между окнами.
      */
-    replicateInputValue: cfg.sync?.replicateInputValue === true,
+    replicateInputValue: cfg.sync?.replicateInputValue !== false,
     /**
      * Поднимать окно Dolphin на передний план при повторе событий (клик, вкладка, новая вкладка, openOnConnect).
      * На одном ПК с главным браузером поставьте false — свёрнутые/фоновые агенты не будут открываться при каждом клике на главном.
@@ -2260,17 +2259,57 @@ async function main() {
   }
 
   async function applyInput(ev, page) {
-    if (!ev.selector) return;
-    await page.evaluate(({ selector, value }) => {
-      const el = document.querySelector(selector);
+    await page.evaluate(({ selector, value, selStart, selEnd, nx, ny }) => {
+      const pickByPoint = () => {
+        if (typeof nx !== 'number' || typeof ny !== 'number') return null;
+        const vv = window.visualViewport;
+        const w =
+          document.documentElement?.clientWidth ||
+          window.innerWidth ||
+          (vv && vv.width) ||
+          1;
+        const h =
+          document.documentElement?.clientHeight ||
+          window.innerHeight ||
+          (vv && vv.height) ||
+          1;
+        const x = Math.max(0, Math.min(w - 1, Math.round(Math.max(0, Math.min(1, nx)) * w)));
+        const y = Math.max(0, Math.min(h - 1, Math.round(Math.max(0, Math.min(1, ny)) * h)));
+        return document.elementFromPoint(x, y);
+      };
+      let el = selector ? document.querySelector(selector) : null;
+      if (!el) el = pickByPoint();
       if (!el) return;
-      if ('value' in el) {
-        el.focus();
-        el.value = value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+      el.focus();
+      const next = String(value ?? '');
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc?.set) desc.set.call(el, next);
+      else el.value = next;
+      const s =
+        typeof selStart === 'number'
+          ? Math.max(0, Math.min(next.length, selStart))
+          : next.length;
+      const e =
+        typeof selEnd === 'number'
+          ? Math.max(0, Math.min(next.length, selEnd))
+          : s;
+      try {
+        el.setSelectionRange(s, e);
+      } catch {
+        /* ignore unsupported input types */
       }
-    }, { selector: ev.selector, value: String(ev.value ?? '') });
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, {
+      selector: ev.selector || '',
+      value: String(ev.value ?? ''),
+      selStart: Number.isInteger(ev.selectionStart) ? ev.selectionStart : null,
+      selEnd: Number.isInteger(ev.selectionEnd) ? ev.selectionEnd : null,
+      nx: typeof ev.x === 'number' ? ev.x : null,
+      ny: typeof ev.y === 'number' ? ev.y : null
+    });
   }
 
   async function applyTabSelect(ev, s) {
@@ -2479,7 +2518,14 @@ async function main() {
           const s = sessions[pid];
           if (!s.browser) return;
 
-          if (ev.eventType === 'copy') return;
+          if (ev.eventType === 'copy') {
+            const incoming = String(ev.text ?? '');
+            if (incoming) {
+              clipboardByProfile[pid] = incoming;
+              appendClipboardLog(pid, incoming, { kind: ev.kind || 'copy-controller' });
+            }
+            return;
+          }
 
           if (ev.eventType === 'tabs' && ev.kind === 'new') {
             s.suppressTabBroadcastUntil = Date.now() + 2000;

@@ -12,14 +12,14 @@
   function viewportSize() {
     const vv = window.visualViewport;
     const w =
-      (vv && vv.width) ||
-      window.innerWidth ||
       (document.documentElement && document.documentElement.clientWidth) ||
+      window.innerWidth ||
+      (vv && vv.width) ||
       1;
     const h =
-      (vv && vv.height) ||
-      window.innerHeight ||
       (document.documentElement && document.documentElement.clientHeight) ||
+      window.innerHeight ||
+      (vv && vv.height) ||
       1;
     return { w: Math.max(w, 1), h: Math.max(h, 1) };
   }
@@ -180,10 +180,18 @@
     if (!el) return;
     const isEditable = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement;
     if (!isEditable) return;
+    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    const cx = rect ? rect.left + rect.width / 2 : 0;
+    const cy = rect ? rect.top + Math.min(Math.max(rect.height / 2, 1), 24) : 0;
     send({
       eventType: 'input',
       selector: getSelector(el),
       value: el.value,
+      inputType: e.inputType || '',
+      selectionStart: typeof el.selectionStart === 'number' ? el.selectionStart : null,
+      selectionEnd: typeof el.selectionEnd === 'number' ? el.selectionEnd : null,
+      x: nx(cx),
+      y: ny(cy),
       ts: Date.now(),
       href: location.href
     });

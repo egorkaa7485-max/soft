@@ -36,6 +36,6 @@
     "applyEventConcurrency": 16,
     "viewportCacheMs": 900,
     "mouseMoveThrottleMs": 48,
-    "replicateInputValue": false
+    "replicateInputValue": true
   }
 }

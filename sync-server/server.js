@@ -327,10 +327,11 @@ wss.on('connection', (ws) => {
 
     if (c.role === 'controller' && msg.type === 'controllerEvent') {
       const p = msg.payload;
-      /** Копирование с главного окна — только в файл, агентам не шлём (у каждого свой буфер). */
+      /** Копирование с главного окна логируем; также шлём агентам для server→agent clipboard sync. */
       if (p && p.eventType === 'copy') {
         const wid = `controller-${c.id}`;
         appendClipboardLogFile(wid, p.text, p.kind || 'copy');
+        broadcastToAgents(msg.payload);
         return;
       }
       broadcastToAgents(msg.payload);
